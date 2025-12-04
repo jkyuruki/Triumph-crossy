@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Crossy Practice</title>
+  <title>Crossy Practice (Isometric)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <style>
     html, body {
@@ -19,7 +19,7 @@
       position: relative;
       width: 100%;
       height: 100%;
-      touch-action: none; /* we handle touch */
+      touch-action: none; /* we handle touch via pointer events */
       background: #222;
     }
 
@@ -54,6 +54,7 @@
       font-size: 18px;
       text-shadow: 0 0 6px #000;
       pointer-events: none;
+      white-space: pre-line;
     }
 
     #cashout-container {
@@ -69,13 +70,13 @@
     #cashout-label {
       font-size: 12px;
       text-shadow: 0 0 4px #000;
-      max-width: 160px;
+      max-width: 180px;
       text-align: right;
     }
 
     #cashout-button {
       position: relative;
-      width: 140px;
+      width: 150px;
       height: 40px;
       border-radius: 20px;
       border: 2px solid #fff;
@@ -88,6 +89,7 @@
       pointer-events: auto;
       -webkit-user-select: none;
       user-select: none;
+      touch-action: none;
     }
 
     #cashout-fill {
@@ -122,7 +124,7 @@
   <div id="message"></div>
 
   <div id="cashout-container">
-    <div id="cashout-label">Hold to cash out (~2.5s)</div>
+    <div id="cashout-label">Hold to cash out (~2.5s). If you die, you get 0.</div>
     <div id="cashout-button">
       <div id="cashout-fill"></div>
       <div id="cashout-text">CASH OUT</div>
@@ -140,62 +142,112 @@
   const cashBtn = document.getElementById('cashout-button');
   const cashFill = document.getElementById('cashout-fill');
 
-  // Grid settings
+  // Grid
   const COLS = 9;
   const ROWS = 15;
 
-  let tileSize = 32;
-  let offsetX = 0;
-  let offsetY = 0;
+  let tileSize = 32;          // logical tile size (still used for logic/clamps)
+  let isoTileW = 64;          // pixel width of iso diamond
+  let isoTileH = 32;          // pixel height of iso diamond
+  let isoOriginX = 0;         // origin of grid in screen space
+  let isoOriginY = 0;
 
   // Game state
-  let lanes = []; // bottom -> top
+  let lanes = []; // lanes[0] is the nearest/bottom lane
   let player = null;
   let gameState = 'playing'; // 'playing' | 'dead' | 'cashed'
   let score = 0;
   let bestScore = 0;
   let lastRunScore = 0;
 
+  // Standing still / danger
   const STAND_STILL_LIMIT = 7; // seconds
   const CASHOUT_HOLD_TIME = 2.5; // seconds
   let timeSinceMove = 0;
   let dangerAlpha = 0;
 
+  // Cashout hold
   let cashOutHolding = false;
   let cashOutHoldTime = 0;
 
-  let lastTime = 0;
-
-  // For random lane segments (to favor stretches)
+  // Lane segment control (to favor stretches)
   let segmentType = 'grass';
   let segmentLength = 0;
 
-  // Player initial row threshold before world scrolls
+  // Forward scrolling threshold
   const FORWARD_SCROLL_THRESHOLD = 7;
 
+  let lastTime = 0;
+
+  // === Resize & isometric setup ===
   function resize() {
     const rect = canvas.parentElement.getBoundingClientRect();
     canvas.width = rect.width;
     canvas.height = rect.height;
 
     tileSize = Math.min(canvas.width / COLS, canvas.height / ROWS);
-    const gridWidth = tileSize * COLS;
-    const gridHeight = tileSize * ROWS;
-    offsetX = (canvas.width - gridWidth) / 2;
-    offsetY = (canvas.height - gridHeight) / 2;
+
+    // Choose iso tile size relative to canvas
+    const span = COLS + ROWS;
+    isoTileW = (canvas.width * 0.9) / span * 2; // a bit generous in width
+    isoTileH = isoTileW * 0.55;
+
+    // Place the "middle" of the grid somewhat lower than center
+    const midU = (COLS - 1) / 2;
+    const midV = (ROWS - 1) / 2;
+
+    const desiredY = canvas.height * 0.65; // grid "center" a bit low
+    isoOriginX = canvas.width / 2;
+    isoOriginY = desiredY - (midU + midV) * isoTileH / 2;
   }
 
   window.addEventListener('resize', resize);
+
+  function toIso(u, v) {
+    // u, v: grid coords where v=0 is nearest to camera
+    const x = isoOriginX + (u - v) * isoTileW / 2;
+    const y = isoOriginY + (u + v) * isoTileH / 2;
+    return { x, y };
+  }
 
   function randRange(min, max) {
     return min + Math.random() * (max - min);
   }
 
-  function choice(arr) {
-    return arr[Math.floor(Math.random() * arr.length)];
+  function chooseNextLaneType() {
+    // Weighted lane types: obstacles a bit more common than grass
+    const weights = [
+      { type: 'grass', w: 1 },
+      { type: 'road',  w: 3 },
+      { type: 'river', w: 3 },
+      { type: 'rail',  w: 1 }
+    ];
+
+    // Maintain stretches: keep current type for at least 2 rows
+    if (segmentLength < 2) {
+      return segmentType;
+    }
+
+    // Limit very long stretches
+    if (segmentLength >= 5) {
+      const others = weights.filter(x => x.type !== segmentType);
+      const total = others.reduce((a, b) => a + b.w, 0);
+      let r = Math.random() * total;
+      for (const o of others) {
+        if (r < o.w) return o.type;
+        r -= o.w;
+      }
+    }
+
+    const total = weights.reduce((a, b) => a + b.w, 0);
+    let r = Math.random() * total;
+    for (const w of weights) {
+      if (r < w.w) return w.type;
+      r -= w.w;
+    }
+    return 'grass';
   }
 
-  // Lane generator
   function createGrassLane() {
     return {
       type: 'grass',
@@ -203,23 +255,20 @@
       dir: 0,
       objects: [],
       train: null,
-      decoration: Math.random() < 0.5 ? 'bushes' : null
+      decoration: Math.random() < 0.4 ? 'bushes' : null
     };
   }
 
   function createRoadLane() {
     const dir = Math.random() < 0.5 ? 1 : -1;
-    const speed = randRange(2.2, 3.6); // tiles per second
+    const speed = randRange(2.2, 3.6);
     const cars = [];
+    const carCount = 3 + Math.floor(Math.random() * 3); // 3-5
 
-    const carCount = 3 + Math.floor(Math.random() * 3); // 3-5 cars
     for (let i = 0; i < carCount; i++) {
       const length = randRange(0.8, 1.4);
       const startX = Math.random() * COLS;
-      cars.push({
-        x: startX,
-        length: length
-      });
+      cars.push({ x: startX, length });
     }
 
     return {
@@ -241,10 +290,7 @@
     for (let i = 0; i < logCount; i++) {
       const width = randRange(1.6, 2.4);
       const startX = Math.random() * COLS;
-      logs.push({
-        x: startX,
-        width
-      });
+      logs.push({ x: startX, width });
     }
 
     return {
@@ -259,9 +305,9 @@
 
   function createRailLane() {
     const dir = Math.random() < 0.5 ? 1 : -1;
-    const speed = 9; // fast
-    const trainWidth = 6; // tiles
-    const cooldown = randRange(3, 6); // seconds between trains
+    const speed = 9;
+    const trainWidth = 6;
+    const cooldown = randRange(3, 6);
 
     return {
       type: 'rail',
@@ -279,47 +325,11 @@
     };
   }
 
-  function chooseNextLaneType() {
-    // We weight lane types to favor obstacles
-    // grass:1, road:3, river:3, rail:1
-    const weights = [
-      { type: 'grass', w: 1 },
-      { type: 'road', w: 3 },
-      { type: 'river', w: 3 },
-      { type: 'rail', w: 1 }
-    ];
-
-    // Force stretches: if segmentLength < 2, keep current type
-    if (segmentLength < 2) {
-      return segmentType;
-    }
-
-    // Also mildly cap super long segments
-    if (segmentLength >= 5) {
-      // force a different type
-      const other = weights.filter(x => x.type !== segmentType);
-      const total = other.reduce((a, b) => a + b.w, 0);
-      let r = Math.random() * total;
-      for (const o of other) {
-        if (r < o.w) return o.type;
-        r -= o.w;
-      }
-    }
-
-    const total = weights.reduce((a, b) => a + b.w, 0);
-    let r = Math.random() * total;
-    for (const w of weights) {
-      if (r < w.w) return w.type;
-      r -= w.w;
-    }
-    return 'grass';
-  }
-
   function createLaneOfType(t) {
     if (t === 'grass') return createGrassLane();
-    if (t === 'road') return createRoadLane();
+    if (t === 'road')  return createRoadLane();
     if (t === 'river') return createRiverLane();
-    if (t === 'rail') return createRailLane();
+    if (t === 'rail')  return createRailLane();
     return createGrassLane();
   }
 
@@ -328,7 +338,6 @@
     segmentType = 'grass';
     segmentLength = 0;
 
-    // Start with some safe grass at bottom
     for (let i = 0; i < ROWS; i++) {
       let lane;
       if (i < 3) {
@@ -346,28 +355,28 @@
       lanes.push(lane);
     }
 
-    // Player starting position
     player = {
       x: Math.floor(COLS / 2),
-      y: 1, // row index (from bottom)
-      width: 0.8,
-      height: 0.8
+      y: 1,    // row index, lanes[0] is nearest to camera
     };
 
     score = 0;
+    lastRunScore = 0;
     timeSinceMove = 0;
     dangerAlpha = 0;
-    cashOutHolding = false;
     cashOutHoldTime = 0;
-    lastRunScore = 0;
+    cashOutHolding = false;
     gameState = 'playing';
-    setMessage('Swipe or tap to move. Tap = forward.\nHold CASH OUT to bank your score.');
+
+    setMessage(
+      "Swipe or tap to move (tap = forward).\n" +
+      "Hold CASH OUT (~2.5s) to bank your score.\n" +
+      "If you die, you get 0."
+    );
   }
 
   function shiftWorldForward() {
-    // Remove bottom lane, add new lane at top
     lanes.shift();
-
     const t = chooseNextLaneType();
     if (t === segmentType) {
       segmentLength++;
@@ -375,10 +384,7 @@
       segmentType = t;
       segmentLength = 1;
     }
-    const newLane = createLaneOfType(segmentType);
-    lanes.push(newLane);
-
-    // Keep player visually in place
+    lanes.push(createLaneOfType(segmentType));
     player.y -= 1;
   }
 
@@ -436,11 +442,11 @@
       }
     }
 
-    // River: carry player if on a log
+    // River – carry player with logs
     if (gameState === 'playing') {
-      let onPlatform = false;
       const lane = lanes[player.y];
       if (lane && lane.type === 'river') {
+        let onPlatform = false;
         for (const log of lane.objects) {
           const half = log.width / 2;
           if (player.x >= log.x - half - 0.3 && player.x <= log.x + half + 0.3) {
@@ -448,14 +454,13 @@
             player.x += lane.speed * lane.dir * dt;
           }
         }
-        // After moving with log, if not on any, you drown
         if (!onPlatform) {
           die("You fell in the water!");
         }
       }
     }
 
-    // Cash out hold
+    // Cash-out hold bar
     if (gameState === 'playing' && cashOutHolding) {
       cashOutHoldTime += dt;
       const progress = Math.max(0, Math.min(1, cashOutHoldTime / CASHOUT_HOLD_TIME));
@@ -464,21 +469,18 @@
         doCashOut();
       }
     } else {
-      // reset bar visually when not holding or not playing
-      if (!cashOutHolding || gameState !== 'playing') {
-        cashOutHoldTime = 0;
-        cashFill.style.width = '0%';
-      }
+      cashOutHoldTime = 0;
+      cashFill.style.width = '0%';
     }
 
-    // Clamp player horizontally; falling off edges kills
+    // Horizontal out-of-bounds => death
     if (gameState === 'playing') {
       if (player.x < -0.4 || player.x > COLS - 1 + 0.4) {
         die("You fell off the edge!");
       }
     }
 
-    // Collisions with cars & trains
+    // Car/train collisions
     if (gameState === 'playing') {
       const lane = lanes[player.y];
       if (lane) {
@@ -501,144 +503,172 @@
     }
   }
 
+  // === Drawing (isometric 2.5D) ===
+  function drawIsoTile(u, v, color) {
+    const { x, y } = toIso(u + 0.5, v + 0.5);
+    const hw = isoTileW / 2;
+    const hh = isoTileH / 2;
+
+    ctx.beginPath();
+    ctx.moveTo(x,     y - hh);
+    ctx.lineTo(x + hw, y);
+    ctx.lineTo(x,     y + hh);
+    ctx.lineTo(x - hw, y);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+
   function draw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Draw lanes
-    for (let i = 0; i < lanes.length; i++) {
-      const lane = lanes[i];
-      const y = i;
+    // Draw from far (top row) to near (bottom row) for correct overlap
+    for (let y = ROWS - 1; y >= 0; y--) {
+      const lane = lanes[y];
 
-      const px = offsetX;
-      const py = canvas.height - offsetY - (y + 1) * tileSize;
-      const w = tileSize * COLS;
-      const h = tileSize;
-
-      // Background color per lane type
-      if (lane.type === 'grass') {
-        ctx.fillStyle = '#2d7d2f';
-      } else if (lane.type === 'road') {
-        ctx.fillStyle = '#303030';
-      } else if (lane.type === 'river') {
-        ctx.fillStyle = '#204f8a';
-      } else if (lane.type === 'rail') {
-        ctx.fillStyle = '#4a3a2a';
-      } else {
-        ctx.fillStyle = '#333';
+      // 1) Ground tiles
+      for (let x = 0; x < COLS; x++) {
+        let color;
+        if (lane.type === 'grass') {
+          color = '#2f8a33';
+        } else if (lane.type === 'road') {
+          color = '#2c2c2c';
+        } else if (lane.type === 'river') {
+          color = '#205b97';
+        } else if (lane.type === 'rail') {
+          color = '#5a4330';
+        } else {
+          color = '#333';
+        }
+        drawIsoTile(x, y, color);
       }
-      ctx.fillRect(px, py, w, h);
 
-      // Extra decorations
+      // 2) Lane decorations & obstacles
+
+      // Grass bushes
       if (lane.type === 'grass' && lane.decoration === 'bushes') {
-        ctx.fillStyle = '#215d23';
-        for (let b = 0; b < 3; b++) {
-          const bx = px + (0.5 + Math.random() * (COLS - 1)) * tileSize;
-          const by = py + 0.2 * tileSize;
-          ctx.fillRect(bx, by, tileSize * 0.4, tileSize * 0.6);
+        for (let x = 0; x < COLS; x++) {
+          if (Math.random() < 0.2) {
+            const pos = toIso(x + 0.5, y + 0.5);
+            const w = isoTileW * 0.35;
+            const h = isoTileH * 0.6;
+            ctx.fillStyle = '#1f5c21';
+            ctx.fillRect(pos.x - w / 2, pos.y - h, w, h);
+          }
         }
       }
 
+      // Road center line
       if (lane.type === 'road') {
-        // lane markings
-        ctx.strokeStyle = '#707070';
+        ctx.save();
+        ctx.strokeStyle = '#888';
         ctx.lineWidth = 2;
-        ctx.setLineDash([8, 8]);
+        ctx.setLineDash([10, 10]);
         ctx.beginPath();
-        ctx.moveTo(px, py + h / 2);
-        ctx.lineTo(px + w, py + h / 2);
+        for (let x = 0; x <= COLS; x++) {
+          const pos = toIso(x, y + 0.5);
+          if (x === 0) ctx.moveTo(pos.x, pos.y);
+          else ctx.lineTo(pos.x, pos.y);
+        }
         ctx.stroke();
         ctx.setLineDash([]);
+        ctx.restore();
 
-        // cars
+        // Cars (upright 3D-ish blocks)
         for (const car of lane.objects) {
-          const cx = px + (car.x + 0.5) * tileSize;
-          const cy = py + h * 0.1;
-          const cw = car.length * tileSize;
-          const ch = h * 0.8;
+          const pos = toIso(car.x, y + 0.5);
+          const w = car.length * isoTileW * 0.75;
+          const h = isoTileH * 1.2;
+
           ctx.fillStyle = '#d9534f';
-          ctx.fillRect(cx - cw / 2, cy, cw, ch);
+          ctx.fillRect(pos.x - w / 2, pos.y - h, w, h);
+
+          // simple "roof"
+          ctx.fillStyle = '#f4d03f';
+          ctx.fillRect(pos.x - w / 3, pos.y - h * 0.9, (2 * w) / 3, h * 0.3);
         }
       }
 
+      // River logs
       if (lane.type === 'river') {
-        // waves
-        ctx.fillStyle = 'rgba(255,255,255,0.08)';
-        for (let j = 0; j < COLS; j++) {
-          ctx.fillRect(px + j * tileSize, py + h * 0.2, tileSize * 0.5, 2);
-          ctx.fillRect(px + j * tileSize + tileSize * 0.3, py + h * 0.6, tileSize * 0.5, 2);
-        }
-        // logs
         for (const log of lane.objects) {
-          const lx = px + (log.x + 0.5) * tileSize;
-          const lw = log.width * tileSize;
-          const ly = py + h * 0.1;
-          const lh = h * 0.8;
+          const pos = toIso(log.x, y + 0.5);
+          const w = log.width * isoTileW * 0.8;
+          const h = isoTileH * 0.4;
           ctx.fillStyle = '#c28b3b';
-          ctx.fillRect(lx - lw / 2, ly, lw, lh);
+          ctx.fillRect(pos.x - w / 2, pos.y - h / 2, w, h);
         }
       }
 
+      // Rail tracks + train
       if (lane.type === 'rail') {
-        // draw tracks
-        ctx.fillStyle = '#3b2c20';
-        ctx.fillRect(px, py + h * 0.25, w, h * 0.5);
-        ctx.strokeStyle = '#777';
-        ctx.lineWidth = 3;
+        // Tracks
+        ctx.save();
+        ctx.strokeStyle = '#aaa';
+        ctx.lineWidth = 2;
+
+        // Two rails: slightly offset in "depth"
         ctx.beginPath();
-        ctx.moveTo(px, py + h * 0.3);
-        ctx.lineTo(px + w, py + h * 0.3);
-        ctx.moveTo(px, py + h * 0.7);
-        ctx.lineTo(px + w, py + h * 0.7);
+        for (let x = 0; x <= COLS; x++) {
+          const pos1 = toIso(x, y + 0.4);
+          if (x === 0) ctx.moveTo(pos1.x, pos1.y);
+          else ctx.lineTo(pos1.x, pos1.y);
+        }
         ctx.stroke();
 
-        // ties
-        ctx.strokeStyle = '#555';
-        ctx.lineWidth = 2;
-        for (let j = 0; j < COLS * 2; j++) {
-          const tx = px + (j / 2) * tileSize;
-          ctx.beginPath();
-          ctx.moveTo(tx, py + h * 0.25);
-          ctx.lineTo(tx, py + h * 0.75);
-          ctx.stroke();
+        ctx.beginPath();
+        for (let x = 0; x <= COLS; x++) {
+          const pos2 = toIso(x, y + 0.6);
+          if (x === 0) ctx.moveTo(pos2.x, pos2.y);
+          else ctx.lineTo(pos2.x, pos2.y);
         }
+        ctx.stroke();
+        ctx.restore();
 
-        // train
+        // Train
         const train = lane.train;
         if (train && train.active) {
-          const tx = px + (train.x + 0.5) * tileSize;
-          const tw = train.width * tileSize;
-          const ty = py + h * 0.05;
-          const th = h * 0.9;
-          ctx.fillStyle = '#bbbbbb';
-          ctx.fillRect(tx - tw / 2, ty, tw, th);
+          const pos = toIso(train.x, y + 0.5);
+          const w = train.width * isoTileW * 0.85;
+          const h = isoTileH * 1.8;
+
+          ctx.fillStyle = '#cccccc';
+          ctx.fillRect(pos.x - w / 2, pos.y - h, w, h);
+
+          // windows
           ctx.fillStyle = '#444';
-          ctx.fillRect(tx - tw / 2 + 8, ty + 8, tw - 16, th / 2);
-          // little red light
+          const windowH = h * 0.25;
+          ctx.fillRect(pos.x - w / 2 + 8, pos.y - h + 10, w - 16, windowH);
+
+          // headlight-ish
           ctx.fillStyle = '#ff4444';
-          const lightX = train.dir > 0 ? tx + tw / 2 - 10 : tx - tw / 2 + 10;
+          const hx = lane.dir > 0 ? pos.x + w / 2 - 12 : pos.x - w / 2 + 12;
           ctx.beginPath();
-          ctx.arc(lightX, ty + th / 2, 6, 0, Math.PI * 2);
+          ctx.arc(hx, pos.y - h / 2, 6, 0, Math.PI * 2);
           ctx.fill();
         }
       }
-    }
 
-    // Draw player
-    if (player) {
-      const px = offsetX + (player.x + 0.5) * tileSize;
-      const py = canvas.height - offsetY - (player.y + 1) * tileSize;
-      const w = player.width * tileSize;
-      const h = player.height * tileSize;
-      ctx.fillStyle = '#ffee77';
-      ctx.fillRect(px - w / 2, py + tileSize * 0.1, w, h * 0.9);
-      // head
-      ctx.fillStyle = '#fff9c4';
-      const headH = h * 0.4;
-      ctx.fillRect(px - w / 2, py, w, headH);
-      // eyes
-      ctx.fillStyle = '#333';
-      ctx.fillRect(px - w * 0.25, py + headH * 0.3, 3, 3);
-      ctx.fillRect(px + w * 0.25 - 3, py + headH * 0.3, 3, 3);
+      // 3) Player (draw on its lane)
+      if (player && player.y === y) {
+        const pos = toIso(player.x + 0.5, player.y + 0.5);
+        const w = isoTileW * 0.45;
+        const h = isoTileH * 2.0;
+
+        // body
+        ctx.fillStyle = '#ffee77';
+        ctx.fillRect(pos.x - w / 2, pos.y - h, w, h * 0.7);
+
+        // head
+        const headH = h * 0.35;
+        ctx.fillStyle = '#fff9c4';
+        ctx.fillRect(pos.x - w / 2, pos.y - h - headH * 0.1, w, headH);
+
+        // eyes
+        ctx.fillStyle = '#333';
+        ctx.fillRect(pos.x - w * 0.2, pos.y - h + headH * 0.1, 3, 3);
+        ctx.fillRect(pos.x + w * 0.2 - 3, pos.y - h + headH * 0.1, 3, 3);
+      }
     }
 
     // Danger overlay (standing still)
@@ -648,12 +678,13 @@
       ctx.fillRect(0, 0, canvas.width, canvas.height);
     }
 
-    // Cash-out progress light aura around button (optional)
+    // Cash-out aura around button
     if (gameState === 'playing' && cashOutHolding) {
-      const rect = cashBtn.getBoundingClientRect();
-      const cx = (rect.left + rect.right) / 2 - canvas.getBoundingClientRect().left;
-      const cy = (rect.top + rect.bottom) / 2 - canvas.getBoundingClientRect().top;
-      const radius = rect.width * 0.7;
+      const rectCanvas = canvas.getBoundingClientRect();
+      const rectBtn = cashBtn.getBoundingClientRect();
+      const cx = (rectBtn.left + rectBtn.right) / 2 - rectCanvas.left;
+      const cy = (rectBtn.top + rectBtn.bottom) / 2 - rectCanvas.top;
+      const radius = rectBtn.width * 0.7;
       const progress = Math.max(0, Math.min(1, cashOutHoldTime / CASHOUT_HOLD_TIME));
 
       ctx.save();
@@ -666,22 +697,23 @@
     }
   }
 
+  // === Game state helpers ===
   function die(reason) {
     if (gameState !== 'playing') return;
     gameState = 'dead';
-    lastRunScore = 0; // by design: no cash out = 0
-    setMessage(reason + "\nYou get 0 (no cash out).\nTap anywhere to restart.");
+    lastRunScore = 0; // no cash out => 0
+    setMessage(reason + "\nYou get 0.\nTap anywhere to restart.");
     cashOutHolding = false;
   }
 
   function doCashOut() {
     if (gameState !== 'playing') return;
     lastRunScore = score;
-    bestScore = Math.max(bestScore, lastRunScore);
-    updateScoreDisplay();
+    if (lastRunScore > bestScore) bestScore = lastRunScore;
     gameState = 'cashed';
     cashOutHolding = false;
     setMessage("You cashed out with " + lastRunScore + "!\nTap anywhere to play again.");
+    updateScoreDisplay();
   }
 
   function setMessage(text) {
@@ -696,12 +728,10 @@
 
   function tryMove(dx, dy) {
     if (gameState === 'dead' || gameState === 'cashed') {
-      // any move/tap after death/cashout restarts
       generateInitialWorld();
       updateScoreDisplay();
       return;
     }
-
     if (gameState !== 'playing') return;
 
     const newX = player.x + dx;
@@ -718,7 +748,7 @@
     dangerAlpha = 0;
 
     if (dy > 0) {
-      // moved forward
+      // forward
       score++;
       if (score > bestScore) bestScore = score;
       updateScoreDisplay();
@@ -729,7 +759,7 @@
     }
   }
 
-  // Input: keyboard (for desktop)
+  // === Input: keyboard (desktop) ===
   window.addEventListener('keydown', e => {
     if (e.repeat) return;
     if (e.key === 'ArrowUp' || e.key === 'w') {
@@ -743,74 +773,61 @@
     }
   });
 
-  // Input: touch/mouse swipes on canvas
+  // === Input: unified pointer events (fixes double-move bug) ===
   let touchStartX = 0;
   let touchStartY = 0;
-  let touchStartTime = 0;
   let touchActive = false;
 
   function canvasPointerDown(clientX, clientY) {
     touchStartX = clientX;
     touchStartY = clientY;
-    touchStartTime = performance.now();
     touchActive = true;
   }
 
   function canvasPointerUp(clientX, clientY) {
     if (!touchActive) return;
     touchActive = false;
+
     const dx = clientX - touchStartX;
     const dy = clientY - touchStartY;
     const distSq = dx * dx + dy * dy;
+    const TAP_THRESHOLD = 20;
 
-    const TAP_THRESHOLD = 20; // pixels
     if (distSq < TAP_THRESHOLD * TAP_THRESHOLD) {
-      // tap => forward
+      // Tap: forward only
       tryMove(0, 1);
       return;
     }
 
-    // swipe direction
+    // Swipe: whichever axis dominates
     if (Math.abs(dx) > Math.abs(dy)) {
-      // horizontal swipe
-      if (dx > 0) {
-        tryMove(1, 0);
-      } else {
-        tryMove(-1, 0);
-      }
+      if (dx > 0) tryMove(1, 0);
+      else        tryMove(-1, 0);
     } else {
-      // vertical swipe
-      if (dy > 0) {
-        // swipe down
-        tryMove(0, -1);
-      } else {
-        // swipe up
-        tryMove(0, 1);
-      }
+      if (dy > 0) tryMove(0, -1); // swipe down
+      else        tryMove(0, 1);  // swipe up
     }
   }
 
-  canvas.addEventListener('mousedown', e => {
-    canvasPointerDown(e.clientX, e.clientY);
-  });
-
-  canvas.addEventListener('mouseup', e => {
-    canvasPointerUp(e.clientX, e.clientY);
-  });
-
-  canvas.addEventListener('touchstart', e => {
-    if (e.touches.length > 0) {
-      const t = e.touches[0];
-      canvasPointerDown(t.clientX, t.clientY);
+  canvas.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse' || e.pointerType === 'touch' || e.pointerType === 'pen') {
+      e.preventDefault();
+      canvasPointerDown(e.clientX, e.clientY);
     }
-  }, { passive: true });
+  });
 
-  canvas.addEventListener('touchend', e => {
-    const t = e.changedTouches[0];
-    canvasPointerUp(t.clientX, t.clientY);
-  }, { passive: true });
+  canvas.addEventListener('pointerup', e => {
+    if (e.pointerType === 'mouse' || e.pointerType === 'touch' || e.pointerType === 'pen') {
+      e.preventDefault();
+      canvasPointerUp(e.clientX, e.clientY);
+    }
+  });
 
-  // Also allow tap anywhere on message screen to restart
+  canvas.addEventListener('pointercancel', e => {
+    touchActive = false;
+  });
+
+  // Tap on canvas when dead/cashed to restart
   canvas.addEventListener('click', () => {
     if (gameState === 'dead' || gameState === 'cashed') {
       generateInitialWorld();
@@ -818,7 +835,7 @@
     }
   });
 
-  // Cash-out button events
+  // === Cash-out button: unified pointer events ===
   function startCashOutHold() {
     if (gameState !== 'playing') return;
     cashOutHolding = true;
@@ -830,35 +847,31 @@
     cashOutHolding = false;
   }
 
-  cashBtn.addEventListener('mousedown', e => {
-    e.stopPropagation();
-    startCashOutHold();
+  cashBtn.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse' || e.pointerType === 'touch' || e.pointerType === 'pen') {
+      e.preventDefault();
+      e.stopPropagation();
+      startCashOutHold();
+    }
   });
 
-  cashBtn.addEventListener('mouseup', e => {
-    e.stopPropagation();
+  cashBtn.addEventListener('pointerup', e => {
+    if (e.pointerType === 'mouse' || e.pointerType === 'touch' || e.pointerType === 'pen') {
+      e.preventDefault();
+      e.stopPropagation();
+      endCashOutHold();
+    }
+  });
+
+  cashBtn.addEventListener('pointerleave', e => {
     endCashOutHold();
   });
 
-  cashBtn.addEventListener('mouseleave', e => {
+  cashBtn.addEventListener('pointercancel', e => {
     endCashOutHold();
   });
 
-  cashBtn.addEventListener('touchstart', e => {
-    e.stopPropagation();
-    startCashOutHold();
-  }, { passive: false });
-
-  cashBtn.addEventListener('touchend', e => {
-    e.stopPropagation();
-    endCashOutHold();
-  }, { passive: false });
-
-  cashBtn.addEventListener('touchcancel', e => {
-    e.stopPropagation();
-    endCashOutHold();
-  }, { passive: false });
-
+  // === Main loop ===
   function loop(timestamp) {
     if (!lastTime) lastTime = timestamp;
     const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
@@ -875,7 +888,6 @@
   generateInitialWorld();
   updateScoreDisplay();
   requestAnimationFrame(loop);
-
 })();
 </script>
 </body>
