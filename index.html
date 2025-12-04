@@ -444,19 +444,28 @@
       }
     }
 
-    // River: carry player if on log; drown if not
+    // River: logs move under you, and they carry you if you're on them.
     if (gameState === 'playing') {
       const lane = lanes[player.y];
       if (lane && lane.type === 'river') {
         let onPlatform = false;
+        let carry = 0;
+
         for (const log of lane.objects) {
           const half = log.width / 2;
-          if (player.x >= log.x - half && player.x <= log.x + half) {
+          // small margin so visuals & collision feel aligned
+          if (player.x >= log.x - half - 0.1 && player.x <= log.x + half + 0.1) {
             onPlatform = true;
-            player.x += lane.speed * lane.dir * dt;
+            carry = lane.speed * lane.dir * dt;
+            break;
           }
         }
-        if (!onPlatform) {
+
+        if (onPlatform) {
+          // ride the log
+          player.x += carry;
+        } else {
+          // nothing under you: drown
           die("You fell in the water!");
         }
       }
@@ -475,7 +484,7 @@
       cashFill.style.width = '0%';
     }
 
-    // Clamp x a bit to avoid drift
+    // Clamp x slightly to avoid crazy drift
     if (player) {
       player.x = Math.max(-1, Math.min(COLS, player.x));
     }
@@ -713,7 +722,9 @@
     }
     if (gameState !== 'playing') return;
 
-    const newX = player.x + dx;
+    // Snap to nearest tile horizontally before applying side move
+    const baseX = Math.round(player.x);
+    const newX = baseX + dx;
     const newY = player.y + dy;
 
     if (newX < 0 || newX > COLS - 1) return;
@@ -743,9 +754,9 @@
         }
       }
 
-      // Forward into *already visited* territory: no score, no timer change
+      // Forward into already visited tiles: no score, no timer change
     } else if (dy < 0) {
-      // Backwards reduces current position but not score (furthestProgress stays)
+      // Backwards reduces current position index but not score (furthestProgress stays)
       progressIndex = Math.max(0, progressIndex - 1);
       // No effect on timeSinceMove
     } else {
